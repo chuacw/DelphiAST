@@ -3,7 +3,8 @@ unit DelphiAST.SimpleParserEx;
 interface
 
 uses
-  SysUtils, Generics.Collections, SimpleParser, SimpleParser.Lexer.Types, SimpleParser.Lexer;
+  SysUtils, Generics.Collections, SimpleParser, SimpleParser.Lexer.Types,
+  SimpleParser.Lexer, Classes;
 
 type
   TStringEvent = procedure(var s: string) of object;
@@ -17,7 +18,6 @@ type
     function GetFileName: string;
   public
     constructor Create(const ALexer: TmwPasLex; AOnHandleString: TStringEvent);
-
     property FileName: string read GetFileName;
     property PosXY: TTokenPoint read GetPosXY;
     property Token: string read GetToken;
@@ -25,44 +25,68 @@ type
   end;
 
   TmwSimplePasParEx = class(TmwSimplePasPar)
-  strict protected type
+  public type
     TNameListStack = class;
     TNameList = class
-    strict private type
+    public type
       TNameItem = class
+      public type
+        TNameItemToken = class
+        strict private
+          FTokenFileName: string;
+          FTokenPoint: TTokenPoint;
+          FTokenPos: Integer;
+          FTokenLen: Integer;
+        public
+          constructor Create(const ATokenFileName: string;
+            const ATokenPoint: TTokenPoint; const ATokenPos, ATokenLen: Integer);
+          property TokenFileName: string read FTokenFileName;
+          property TokenPoint: TTokenPoint read FTokenPoint;
+          property TokenPos: Integer read FTokenPos;
+          property TokenLen: Integer read FTokenLen;
+        end;
       strict private
-        FTokenPoint: TTokenPoint;
-        FTokenPos: Integer;
-        FNextTokenPos: Integer;
+        FTokenList: TObjectList<TNameItemToken>;
         FEndNameCalled: Boolean;
-        function GetTokenLen: Integer; inline;
+        function GetLastNameItemToken: TNameItemToken;
       public
-        constructor Create(const ATokenPoint: TTokenPoint;
-          const ATokenPos: Integer);
-        property TokenPoint: TTokenPoint read FTokenPoint;
-        property TokenPos: Integer read FTokenPos;
-        property NextTokenPos: Integer read FNextTokenPos write FNextTokenPos;
-        property TokenLen: Integer read GetTokenLen;
+        constructor Create(const ATokenFileName: string;
+          const ATokenPoint: TTokenPoint; const ATokenID: TptTokenKind;
+          const ATokenPos, ATokenLen: Integer);
+        destructor Destroy; override;
+        procedure AddToken(const ATokenFileName: string;
+          const ATokenPoint: TTokenPoint; const ATokenID: TptTokenKind;
+          const ATokenPos, ATokenLen: Integer);
+        property TokenList: TObjectList<TNameItemToken> read FTokenList;
+        property LastNameItemToken: TNameItemToken read GetLastNameItemToken;
         property EndNameCalled: Boolean read FEndNameCalled write FEndNameCalled;
       end;
     strict private
       FParser: TmwSimplePasParEx;
       FNameItems: TObjectList<TNameItem>;
+      FAutoCreated: Boolean;
       function GetItems(const Index: Integer): TNameItem; inline;
       function GetLastItem: TNameItem; inline;
+      function GetOriginalNames(const Index: Integer): string;
       function GetNames(const Index: Integer): string;
+      function GetLastOriginalName: string;
       function GetLastName: string;
       function GetCount: Integer; inline;
       function GetLexer: TmwPasLex; inline;
       property Lexer: TmwPasLex read GetLexer;
     public
-      constructor Create(const AParser: TmwSimplePasParEx);
+      constructor Create(const AParser: TmwSimplePasParEx;
+        const AAutoCreated: Boolean);
       destructor Destroy; override;
       procedure BeginName;
       procedure EndName;
+      procedure AddToken;
+      property AutoCreated: Boolean read FAutoCreated;
       property Items[const Index: Integer]: TNameItem read GetItems;
       property LastItem: TNameItem read GetLastItem;
+      property OriginalNames[const Index: Integer]: string read GetOriginalNames;
       property Names[const Index: Integer]: string read GetNames; default;
+      property LastOriginalName: string read GetLastOriginalName;
       property LastName: string read GetLastName;
       property Count: Integer read GetCount;
     end;
@@ -73,10 +97,12 @@ type
     public
       constructor Create(const AParser: TmwSimplePasParEx);
       destructor Destroy; override;
-      procedure PushNames; inline;
+      procedure PushNames(const AAutoCreated: Boolean); inline;
       procedure PopNames; inline;
       function ExtractNames: TNameList; inline;
       function PeekNames: TNameList; inline;
+      function ToArray: TArray<TNameList>; inline;
+      function Count: Integer; inline;
     end;
   strict private
     FNameListStack: TNameListStack;
@@ -94,6 +120,8 @@ type
     procedure EndName;
     property CurrentNames: TNameList read GetCurrentNames;
     property PreviousNames: TNameList read FPreviousNames;
+  protected
+    procedure NextToken; override;
   public
     constructor Create; override;
     destructor Destroy; override;
@@ -129,24 +157,53 @@ begin
   FOnHandleString(Result);
 end;
 
+{ TmwSimplePasParEx.TNameList.TNameItem.TNameItemToken }
+
+constructor TmwSimplePasParEx.TNameList.TNameItem.TNameItemToken.Create(
+  const ATokenFileName: string; const ATokenPoint: TTokenPoint;
+  const ATokenPos, ATokenLen: Integer);
+begin
+  FTokenFileName := ATokenFileName;
+  FTokenPoint := ATokenPoint;
+  FTokenPos := ATokenPos;
+  FTokenLen := ATokenLen;
+end;
+
 { TPasNamesBuilder.TNamesList.TNameItem }
 
 constructor TmwSimplePasParEx.TNameList.TNameItem.Create(
-  const ATokenPoint: TTokenPoint; const ATokenPos: Integer);
+  const ATokenFileName: string; const ATokenPoint: TTokenPoint;
+  const ATokenID: TptTokenKind; const ATokenPos, ATokenLen: Integer);
 begin
-  FTokenPoint := ATokenPoint;
-  FTokenPos := ATokenPos;
-  FNextTokenPos := ATokenPos;
+  FTokenList := TObjectList<TNameItemToken>.Create(True);
+  AddToken(ATokenFileName, ATokenPoint, ATokenID, ATokenPos, ATokenLen);
 end;
 
-function TmwSimplePasParEx.TNameList.TNameItem.GetTokenLen: Integer;
+destructor TmwSimplePasParEx.TNameList.TNameItem.Destroy;
 begin
-  Result := FNextTokenPos - FTokenPos;
+  FTokenList.Free;
+  inherited;
+end;
+
+procedure TmwSimplePasParEx.TNameList.TNameItem.AddToken(
+  const ATokenFileName: string; const ATokenPoint: TTokenPoint;
+  const ATokenID: TptTokenKind; const ATokenPos, ATokenLen: Integer);
+begin
+  if not IsTokenIDJunk(ATokenID) and
+      ((FTokenList.Count = 0) or (FTokenList.Last.TokenPos < ATokenPos)) then
+    FTokenList.Add(TNameItemToken.Create(
+      ATokenFileName, ATokenPoint, ATokenPos, ATokenLen));
+end;
+
+function TmwSimplePasParEx.TNameList.TNameItem.GetLastNameItemToken: TNameItemToken;
+begin
+  Result := TokenList.Last;
 end;
 
 { TPasNamesBuilder.TNamesList }
 
-constructor TmwSimplePasParEx.TNameList.Create(const AParser: TmwSimplePasParEx);
+constructor TmwSimplePasParEx.TNameList.Create(const AParser: TmwSimplePasParEx;
+  const AAutoCreated: Boolean);
 begin
   FParser := AParser;
   FNameItems := TObjectList<TNameItem>.Create(True);
@@ -165,16 +222,19 @@ end;
 
 procedure TmwSimplePasParEx.TNameList.BeginName;
 begin
-  FNameItems.Add(TNameItem.Create(Lexer.PosXY, Lexer.TokenPos));
+  FNameItems.Add(TNameItem.Create(Lexer.FileName, Lexer.PosXY, Lexer.TokenID,
+    Lexer.TokenPos, Lexer.TokenLen));
 end;
 
 procedure TmwSimplePasParEx.TNameList.EndName;
 begin
-  with FNameItems.Last do
-  begin
-    NextTokenPos := Lexer.TokenPos;
-    EndNameCalled := True;
-  end;
+  FNameItems.Last.EndNameCalled := True;
+end;
+
+procedure TmwSimplePasParEx.TNameList.AddToken;
+begin
+  FNameItems.Last.AddToken(Lexer.FileName, Lexer.PosXY, Lexer.TokenID,
+    Lexer.TokenPos, Lexer.TokenLen);
 end;
 
 function TmwSimplePasParEx.TNameList.GetItems(const Index: Integer): TNameItem;
@@ -187,16 +247,36 @@ begin
   Result := FNameItems.Last;
 end;
 
-function TmwSimplePasParEx.TNameList.GetNames(const Index: Integer): string;
+function TmwSimplePasParEx.TNameList.GetOriginalNames(const Index: Integer): string;
 var
+  I: Integer;
   NameItem: TNameItem;
+  Token: string;
 begin
+  Result := '';
   NameItem := Items[Index];
-  SetString(Result, Lexer.Buffer.Buf + NameItem.TokenPos, NameItem.TokenLen);
-  Result := Trim(Result);
-  if FParser.LowerCaseNames then
-    Result := LowerCase(Result);
+  for I := 0 to NameItem.TokenList.Count - 1 do
+  begin
+    SetString(Token, Lexer.Buffer.Buf + NameItem.TokenList[I].TokenPos,
+      NameItem.TokenList[I].TokenLen);
+    Result := Result + Token;
+  end;
   FParser.DoHandleString(Result);
+end;
+
+function TmwSimplePasParEx.TNameList.GetNames(const Index: Integer): string;
+begin
+  Result := OriginalNames[Index];
+  if FParser.LowerCaseNames then
+  begin
+    Result := Result.ToLower;
+    FParser.DoHandleString(Result);
+  end;
+end;
+
+function TmwSimplePasParEx.TNameList.GetLastOriginalName: string;
+begin
+  Result := OriginalNames[Count - 1];
 end;
 
 function TmwSimplePasParEx.TNameList.GetLastName: string;
@@ -211,6 +291,11 @@ end;
 
 { TPasNamesBuilder.TNameListStack }
 
+function TmwSimplePasParEx.TNameListStack.Count: Integer;
+begin
+  Result := FNameListStack.Count;
+end;
+
 constructor TmwSimplePasParEx.TNameListStack.Create(
   const AParser: TmwSimplePasParEx);
 begin
@@ -224,9 +309,9 @@ begin
   inherited;
 end;
 
-procedure TmwSimplePasParEx.TNameListStack.PushNames;
+procedure TmwSimplePasParEx.TNameListStack.PushNames(const AAutoCreated: Boolean);
 begin
-  FNameListStack.Push(TNameList.Create(FParser));
+  FNameListStack.Push(TNameList.Create(FParser, AAutoCreated));
 end;
 
 procedure TmwSimplePasParEx.TNameListStack.PopNames;
@@ -244,14 +329,19 @@ begin
   Result := FNameListStack.Peek;
 end;
 
+function TmwSimplePasParEx.TNameListStack.ToArray: TArray<TNameList>;
+begin
+  Result := FNameListStack.ToArray;
+end;
+
 { TmwSimplePasParEx }
 
 constructor TmwSimplePasParEx.Create;
 begin
   inherited;
   FNameListStack := TNameListStack.Create(Self);
-  FNameListStack.PushNames;
-  FPreviousNames := TNameList.Create(Self);
+  FNameListStack.PushNames(True);
+  FPreviousNames := TNameList.Create(Self, True);
   FLexer := TPasLexer.Create(inherited Lexer, DoHandleString);
   FLowerCaseNames := True;
 end;
@@ -265,9 +355,20 @@ begin
   inherited;
 end;
 
+procedure TmwSimplePasParEx.NextToken;
+var
+  NameList: TNameList;
+begin
+  if FNameListStack.Count > 0 then
+    for NameList in FNameListStack.ToArray do
+      if (NameList.Count > 0) and not NameList.LastItem.EndNameCalled then
+        NameList.AddToken;
+  inherited;
+end;
+
 procedure TmwSimplePasParEx.PushNames;
 begin
-  FNameListStack.PushNames;
+  FNameListStack.PushNames(False);
 end;
 
 procedure TmwSimplePasParEx.PopNames;
@@ -288,7 +389,7 @@ begin
   NameList := FNameListStack.PeekNames;
   if (NameList.Count > 0) and not NameList.LastItem.EndNameCalled then
   begin
-    FNameListStack.PushNames;
+    FNameListStack.PushNames(True);
     NameList := FNameListStack.PeekNames;
   end;
   NameList.BeginName;
